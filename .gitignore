@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Signing material: never publish (see packaging/.gitignore)
+packaging/devcert.pfx
+packaging/devcert.password.txt
+*.pfx
+*.password.txt
+
+# Project memory and internal notes (contain reverse-engineering analysis)
+brain.md
+
+# Release binaries and installers: attach to GitHub Releases, do not commit
+/dist_x64/
+/dist_arm64/
+*.msix
+*.zip
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

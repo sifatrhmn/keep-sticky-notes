@@ -1,0 +1,56 @@
+[package]
+name = "keep-sticky-notes"
+version = "1.1.0"
+authors = ["Dr Sifat (https://github.com/sifatrhmn)"]
+license = "MIT"
+edition = "2021"
+description = "Native Windows sticky notes that synchronise with Google Keep"
+build = "build.rs"
+
+[lib]
+name = "keepsticky"
+path = "src/lib.rs"
+
+[[bin]]
+name = "KeepStickyNotes"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fastrand = "2"
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
+native-tls = "0.2"
+webview2-com = "0.39"
+windows-core = "0.62"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_RichEdit",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Touch",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
