@@ -1,6 +1,6 @@
 [package]
 name = "keep-sticky-notes"
-version = "1.1.0"
+version = "1.1.1"
 authors = ["Dr Sifat (https://github.com/sifatrhmn)"]
 license = "MIT"
 edition = "2021"

@@ -9,7 +9,7 @@ mod theme;
 
 use keepsticky::auth::{new_android_id, Account};
 use keepsticky::creds;
-use keepsticky::keep::{KeepError, UnofficialKeep};
+use keepsticky::keep::{KeepBackend, KeepError, MockKeep, UnofficialKeep};
 use keepsticky::store::{Store, TYPE_NOTE};
 use keepsticky::sync::{SyncEngine, SyncError, KEY_BULK_APPROVED, KEY_TWO_WAY};
 use note::NoteWin;
@@ -311,6 +311,26 @@ fn load_account(store: &Store) -> Option<Account> {
     Some(Account { email, master_token, android_id })
 }
 
+/// The live Google backend, or (debug builds only, `KEEP_STICKY_MOCK=1`) an in-memory
+/// stand-in used to reproduce problems without contacting Google.
+enum Backend {
+    Live(UnofficialKeep),
+    Mock(MockKeep),
+}
+
+impl KeepBackend for Backend {
+    fn changes(&self, request: &serde_json::Value) -> Result<serde_json::Value, KeepError> {
+        match self {
+            Backend::Live(b) => b.changes(request),
+            Backend::Mock(b) => b.changes(request),
+        }
+    }
+}
+
+fn mock_requested() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("KEEP_STICKY_MOCK").is_some()
+}
+
 fn sync_thread(db: PathBuf, rx: std::sync::mpsc::Receiver<SyncCmd>, hwnd: isize, status: Arc<Mutex<String>>) {
     let store = match Store::open(&db) {
         Ok(s) => s,
@@ -319,7 +339,7 @@ fn sync_thread(db: PathBuf, rx: std::sync::mpsc::Receiver<SyncCmd>, hwnd: isize,
             return;
         }
     };
-    let mut backend: Option<UnofficialKeep> = None;
+    let mut backend: Option<Backend> = None;
     let mut next = Instant::now() + Duration::from_secs(2);
     let mut delay = POLL;
     let mut paused = false;
@@ -351,6 +371,9 @@ fn sync_thread(db: PathBuf, rx: std::sync::mpsc::Receiver<SyncCmd>, hwnd: isize,
             next = Instant::now() + Duration::from_secs(86_400);
             continue;
         }
+        if backend.is_none() && mock_requested() {
+            backend = Some(Backend::Mock(MockKeep::default()));
+        }
         if backend.is_none() {
             let Some(account) = load_account(&store) else {
                 *status.lock().unwrap() = "Not signed in. Notes are saved on this computer only.".into();
@@ -359,7 +382,7 @@ fn sync_thread(db: PathBuf, rx: std::sync::mpsc::Receiver<SyncCmd>, hwnd: isize,
                 continue;
             };
             match UnofficialKeep::new(account) {
-                Ok(b) => backend = Some(b),
+                Ok(b) => backend = Some(Backend::Live(b)),
                 Err(e) => {
                     *status.lock().unwrap() = e.to_string();
                     notify(false);

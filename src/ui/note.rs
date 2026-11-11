@@ -1291,7 +1291,8 @@ impl NoteWin {
                 SetTextColor(dc, rgb(pal.accent));
                 self.draw_glyph(dc, 0xE73E, b);
             }
-            if active.as_deref() != Some(r.id.as_str()) {
+            // Windows reads an empty buffer through an invalid pointer, so empty items draw no text.
+            if active.as_deref() != Some(r.id.as_str()) && !r.text.is_empty() {
                 SelectObject(dc, if r.checked { f.strike } else { f.ui }.into());
                 SetTextColor(dc, rgb(if r.checked { pal.muted } else { pal.text }));
                 let mut w: Vec<u16> = r.text.encode_utf16().collect();
