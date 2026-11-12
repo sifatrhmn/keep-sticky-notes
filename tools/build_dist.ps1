@@ -82,3 +82,5 @@ foreach ($t in $targets) {
     }
     "{0}: portable PE machine 0x{1:X4}, {2:N1} MB" -f $t.Arch, $machine, ((Get-Item $exe).Length / 1MB)
 }
+
+& (Join-Path $PSScriptRoot 'make_zips.ps1')
