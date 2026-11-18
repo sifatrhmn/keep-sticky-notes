@@ -22,3 +22,6 @@ brain.md
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Local instructions for Claude (contain project history)
+CLAUDE.md

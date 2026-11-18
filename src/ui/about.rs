@@ -112,6 +112,9 @@ pub fn show() {
 
 extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        if let Some(r) = theme::frame_message(h, msg, wp, lp) {
+            return r;
+        }
         if let Some(r) = theme::chrome_message(h, msg, wp, lp) {
             return r;
         }

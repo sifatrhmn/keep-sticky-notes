@@ -11,6 +11,44 @@ pub const ZERO_TS: &str = "1970-01-01T00:00:00.000000Z";
 pub const TYPE_NOTE: &str = "NOTE";
 pub const TYPE_LIST: &str = "LIST";
 pub const TYPE_ITEM: &str = "LIST_ITEM";
+pub const TYPE_BLOB: &str = "BLOB";
+
+/// A drawing attached to a note. Local drawings live only on this PC; drawings made in
+/// Google Keep (`blob_id` set) are shown read-only, because they cannot be uploaded.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Drawing {
+    /// Row id; 0 for a Google Keep drawing whose image has not been downloaded yet.
+    pub id: i64,
+    pub note_id: String,
+    pub blob_id: Option<String>,
+    pub png: Vec<u8>,
+    pub background: Vec<u8>,
+    pub strokes: String,
+}
+
+impl Drawing {
+    pub fn from_keep(&self) -> bool {
+        self.blob_id.is_some()
+    }
+}
+
+/// A Google Keep drawing whose image still needs downloading.
+#[derive(Clone, Debug)]
+pub struct MissingDrawing {
+    pub note_id: String,
+    pub note_server_id: String,
+    pub blob_id: String,
+    pub blob_server_id: String,
+    pub drawing_id: String,
+}
+
+fn keep_drawing_id(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if v.pointer("/blob/type").and_then(|t| t.as_str()) != Some("DRAWING") {
+        return None;
+    }
+    Some(v.pointer("/blob/drawingInfo/drawingId").and_then(|t| t.as_str()).unwrap_or("").to_string())
+}
 pub const SORT_DELTA: i64 = 10_000;
 
 pub type DbResult<T> = rusqlite::Result<T>;
@@ -127,6 +165,11 @@ CREATE TABLE IF NOT EXISTS window_state(
   opacity INTEGER, topmost INTEGER, rolled INTEGER, open INTEGER
 );
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS drawings(
+  id INTEGER PRIMARY KEY, note_id TEXT NOT NULL, blob_id TEXT,
+  png BLOB NOT NULL DEFAULT x'', background BLOB NOT NULL DEFAULT x'', strokes TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_drawings_note ON drawings(note_id);
 PRAGMA user_version = 1;
 ";
 
@@ -332,6 +375,20 @@ impl Store {
     pub fn restore(&self, id: &str) -> DbResult<()> {
         self.update_top(id, |n| n.trashed = String::new())
     }
+    /// Permanently deletes a note: a tombstone is synced so Google Keep deletes it too.
+    /// A note that never reached the server is simply removed.
+    pub fn delete_forever(&self, id: &str) -> DbResult<()> {
+        let Some(mut n) = self.get(id)? else { return Ok(()) };
+        if n.raw.is_empty() {
+            for c in self.children(id)? {
+                self.remove(&c.id)?;
+            }
+            self.conn.execute("DELETE FROM drawings WHERE note_id=?1", [id])?;
+            return self.remove(id);
+        }
+        n.deleted = now_ts();
+        self.touch(&mut n)
+    }
     pub fn set_label(&self, id: &str, label: &str, on: bool) -> DbResult<()> {
         self.update_top(id, |n| {
             n.label_ids.retain(|l| l != label);
@@ -527,9 +584,91 @@ impl Store {
     }
 
     /// Clears everything tied to one Google account. Callers take a backup first.
+    // ----- drawings -----
+
+    /// Keep drawings first (in server order), then local drawings in the order they were made.
+    pub fn drawings(&self, note: &str) -> DbResult<Vec<Drawing>> {
+        let mut out = Vec::new();
+        for blob in self.children(note)? {
+            if blob.node_type != TYPE_BLOB || blob.is_deleted() || keep_drawing_id(&blob.raw).is_none() {
+                continue;
+            }
+            let row = self
+                .conn
+                .query_row("SELECT id, png FROM drawings WHERE blob_id=?1", [&blob.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                .ok();
+            let (id, png) = row.unwrap_or((0, Vec::new()));
+            out.push(Drawing { id, note_id: note.into(), blob_id: Some(blob.id), png, background: Vec::new(), strokes: "[]".into() });
+        }
+        let mut st = self.conn.prepare("SELECT id, png, background, strokes FROM drawings WHERE note_id=?1 AND blob_id IS NULL ORDER BY id")?;
+        let local = st.query_map([note], |r| {
+            Ok(Drawing { id: r.get(0)?, note_id: note.into(), blob_id: None, png: r.get(1)?, background: r.get(2)?, strokes: r.get(3)? })
+        })?;
+        for d in local {
+            out.push(d?);
+        }
+        Ok(out)
+    }
+
+    pub fn drawing(&self, id: i64) -> DbResult<Option<Drawing>> {
+        self.conn
+            .query_row("SELECT id, note_id, blob_id, png, background, strokes FROM drawings WHERE id=?1", [id], |r| {
+                Ok(Drawing { id: r.get(0)?, note_id: r.get(1)?, blob_id: r.get(2)?, png: r.get(3)?, background: r.get(4)?, strokes: r.get(5)? })
+            })
+            .map(Some)
+            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })
+    }
+
+    /// Adds a local drawing and returns its id.
+    pub fn add_drawing(&self, note: &str, strokes: &str, png: &[u8], background: &[u8]) -> DbResult<i64> {
+        self.conn.execute(
+            "INSERT INTO drawings(note_id, blob_id, png, background, strokes) VALUES(?1, NULL, ?2, ?3, ?4)",
+            rusqlite::params![note, png, background, strokes],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Updates a local drawing. Keep drawings are never changed.
+    pub fn save_drawing(&self, id: i64, strokes: &str, png: &[u8]) -> DbResult<()> {
+        self.conn.execute("UPDATE drawings SET strokes=?2, png=?3 WHERE id=?1 AND blob_id IS NULL", rusqlite::params![id, strokes, png])?;
+        Ok(())
+    }
+
+    pub fn delete_drawing(&self, id: i64) -> DbResult<()> {
+        self.conn.execute("DELETE FROM drawings WHERE id=?1 AND blob_id IS NULL", [id])?;
+        Ok(())
+    }
+
+    /// Stores the downloaded image of a Google Keep drawing.
+    pub fn set_keep_drawing(&self, note: &str, blob_id: &str, png: &[u8]) -> DbResult<()> {
+        self.conn.execute("DELETE FROM drawings WHERE blob_id=?1", [blob_id])?;
+        self.conn.execute(
+            "INSERT INTO drawings(note_id, blob_id, png) VALUES(?1, ?2, ?3)",
+            rusqlite::params![note, blob_id, png],
+        )?;
+        Ok(())
+    }
+
+    /// Google Keep drawings that have no downloaded image yet.
+    pub fn missing_keep_drawings(&self) -> DbResult<Vec<MissingDrawing>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM nodes WHERE node_type='BLOB' AND deleted='' AND server_id IS NOT NULL
+             AND id NOT IN (SELECT blob_id FROM drawings WHERE blob_id IS NOT NULL)"
+        ))?;
+        let blobs: Vec<Node> = st.query_map([], row_node)?.collect::<DbResult<_>>()?;
+        let mut out = Vec::new();
+        for b in blobs {
+            let Some(drawing_id) = keep_drawing_id(&b.raw) else { continue };
+            let Some(note) = self.get(&b.parent_id)? else { continue };
+            let (Some(note_sid), Some(blob_sid)) = (note.server_id.clone(), b.server_id.clone()) else { continue };
+            out.push(MissingDrawing { note_id: note.id, note_server_id: note_sid, blob_id: b.id, blob_server_id: blob_sid, drawing_id });
+        }
+        Ok(out)
+    }
+
     pub fn reset_account_data(&self) -> DbResult<()> {
         self.conn.execute_batch(
-            "BEGIN; DELETE FROM nodes; DELETE FROM labels; DELETE FROM window_state;
+            "BEGIN; DELETE FROM nodes; DELETE FROM labels; DELETE FROM window_state; DELETE FROM drawings WHERE blob_id IS NOT NULL;
              DELETE FROM kv WHERE key IN ('keep_to_version','two_way_sync','bulk_approved','bound_email'); COMMIT;",
         )
     }

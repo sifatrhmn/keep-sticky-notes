@@ -72,6 +72,7 @@ impl<'a, B: KeepBackend> SyncEngine<'a, B> {
         if self.allow_push {
             self.push(&mut report)?;
         }
+        self.fetch_drawings(&mut report);
         self.store.kv_del(KEY_BULK_APPROVED)?;
         Ok(report)
     }
@@ -100,6 +101,19 @@ impl<'a, B: KeepBackend> SyncEngine<'a, B> {
             }
         }
         Err(KeepError::Protocol("too many pages".into()).into())
+    }
+
+    /// Downloads images of drawings made in Google Keep. Failures are retried on the next sync
+    /// and never stop text from syncing.
+    fn fetch_drawings(&self, report: &mut SyncReport) {
+        let Ok(missing) = self.store.missing_keep_drawings() else { return };
+        for m in missing.into_iter().take(20) {
+            if let Ok(png) = self.backend.drawing_image(&m.note_server_id, &m.blob_server_id, &m.drawing_id) {
+                if self.store.set_keep_drawing(&m.note_id, &m.blob_id, &png).is_ok() {
+                    report.changed_notes = true;
+                }
+            }
+        }
     }
 
     fn bulk_approved(&self) -> DbResult<bool> {

@@ -9,6 +9,17 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const API_URL: &str = "https://www.googleapis.com/notes/v1/changes";
+const MEDIA_URL: &str = "https://keep.google.com/media/v2/";
+/// Largest drawing image accepted from the server.
+const MAX_IMAGE: u64 = 20 * 1024 * 1024;
+
+/// A tiny valid PNG (1 x 1, opaque white) returned by the test server.
+pub const TEST_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
+    0x54, 0x08, 0xD7, 0x63, 0xF8, 0xFF, 0xFF, 0x3F, 0x00, 0x05, 0xFE, 0x02, 0xFE, 0xDC, 0xCC, 0x59, 0xE7, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeepError {
@@ -32,6 +43,11 @@ impl std::fmt::Display for KeepError {
 
 pub trait KeepBackend {
     fn changes(&self, request: &Value) -> Result<Value, KeepError>;
+
+    /// Downloads the image of a drawing made in Google Keep (read-only).
+    fn drawing_image(&self, _note_server_id: &str, _blob_server_id: &str, _drawing_id: &str) -> Result<Vec<u8>, KeepError> {
+        Err(KeepError::Protocol("drawings are not supported by this backend".into()))
+    }
 }
 
 pub fn changes_request(nodes: Vec<Value>, target_version: Option<&str>) -> Value {
@@ -233,6 +249,42 @@ impl KeepBackend for UnofficialKeep {
         }
         Err(KeepError::Auth("Google rejected the access token".into()))
     }
+
+    fn drawing_image(&self, note_server_id: &str, blob_server_id: &str, drawing_id: &str) -> Result<Vec<u8>, KeepError> {
+        let mut url = format!("{MEDIA_URL}{note_server_id}/{blob_server_id}");
+        if !drawing_id.is_empty() {
+            url.push('/');
+            url.push_str(drawing_id);
+        }
+        let token = self.access_token(false)?;
+        // The media endpoint answers with a redirect to a short-lived image address.
+        let tls = native_tls::TlsConnector::new().map_err(|e| KeepError::Network(e.to_string()))?;
+        let no_redirect = ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).redirects(0).build();
+        let resp = match no_redirect
+            .get(&url)
+            .set("Authorization", &format!("OAuth {token}"))
+            .set("User-Agent", concat!("KeepStickyNotes/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(30))
+            .call()
+        {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) if (300..400).contains(&code) => r,
+            Err(ureq::Error::Status(code, _)) => return Err(KeepError::Http(code)),
+            Err(e) => return Err(KeepError::Network(e.to_string())),
+        };
+        let location = resp.header("location").map(String::from);
+        let image = match location {
+            Some(loc) => self.agent.get(&loc).timeout(Duration::from_secs(60)).call().map_err(|e| KeepError::Network(e.to_string()))?,
+            None => resp,
+        };
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(image.into_reader(), MAX_IMAGE), &mut bytes)
+            .map_err(|e| KeepError::Network(e.to_string()))?;
+        if bytes.is_empty() {
+            return Err(KeepError::Protocol("empty drawing image".into()));
+        }
+        Ok(bytes)
+    }
 }
 
 // ----- in-memory server for tests -----
@@ -297,6 +349,18 @@ impl MockKeep {
 }
 
 impl KeepBackend for MockKeep {
+    fn drawing_image(&self, _note: &str, blob: &str, _drawing: &str) -> Result<Vec<u8>, KeepError> {
+        if let Some(e) = self.fail_with.lock().unwrap().clone() {
+            return Err(e);
+        }
+        let s = self.state.lock().unwrap();
+        if s.nodes.values().any(|n| n.get("serverId").and_then(Value::as_str) == Some(blob)) {
+            Ok(TEST_PNG.to_vec())
+        } else {
+            Err(KeepError::Http(404))
+        }
+    }
+
     fn changes(&self, request: &Value) -> Result<Value, KeepError> {
         self.requests.lock().unwrap().push(request.clone());
         if let Some(e) = self.fail_with.lock().unwrap().clone() {

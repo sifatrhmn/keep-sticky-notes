@@ -1,11 +1,12 @@
-# Keep Sticky Notes
+# Keep Sticky Notes for Google Keep
 
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)
 ![Architecture: x64 | ARM64](https://img.shields.io/badge/architecture-x64%20%7C%20ARM64-orange.svg)
-![Release: v1.1.0](https://img.shields.io/badge/release-v1.1.0-informational.svg)
+![Release: v1.3.0](https://img.shields.io/badge/release-v1.3.0-informational.svg)
 
-Native Windows sticky notes that synchronise with Google Keep.
+Native Windows sticky notes that synchronise with Google Keep. This is an independent
+project and is not made or endorsed by Google.
 
 Keep Sticky Notes puts your Google Keep notes on the Windows desktop as small, floating
 notes. It is written in Rust against the Win32 API, so each note is an ordinary lightweight
@@ -27,7 +28,14 @@ with no measurable processor use. Native builds are provided for both x64 and AR
 - **Lightweight formatting** for text notes: `**bold**`, `*italic*`, `__underline__`,
   `~~strikethrough~~`, `# heading` and bullets. The markers are stored as plain text, so
   notes remain readable in Keep on the web and on a phone.
-- **Themes:** OLED Black (default), OLED Vibrant and Light.
+- **Themes:** OLED Black (default), Light, and macOS Style in dark and light.
+- **Drawings:** sketch in any note with a pen, marker, highlighter and eraser, using a
+  mouse, touch or pen. Drawings are saved on this PC only. Drawings made in Google Keep
+  are downloaded and shown read-only, because the unofficial protocol cannot upload them;
+  you can edit a local copy.
+- **Note Manager like the Keep app:** notes shown as cards in their own colours, with
+  bold titles, separate Pinned and Others sections, Pin/Unpin, Select All, and a Bin
+  with Restore and Delete Forever.
 - **Note Manager, tray icon and a global hotkey** (`Win+Alt+N`) for a new note.
 - **Two-way synchronisation with safeguards:**
   - synchronisation starts read-only, and nothing is sent to Keep until you enable

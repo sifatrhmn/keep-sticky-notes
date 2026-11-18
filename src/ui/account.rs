@@ -36,12 +36,16 @@ const ROWS: &[Row] = &[
     Row::Text(ID_EMAIL_LABEL),
     Row::Field(ID_EMAIL),
     Row::Buttons(&[ID_SIGN_IN, ID_SYNC, ID_SIGN_OUT]),
-    Row::Buttons(&[ID_TWO_WAY, ID_BACKUPS]),
+    Row::Buttons(&[ID_TWO_WAY, ID_BACKUPS, ID_DATA]),
     Row::Text(ID_STATUS),
+    Row::Text(ID_CRASH),
     Row::Text(ID_WARNING),
 ];
 const DEVICES_URL: &str = "https://myaccount.google.com/device-activity";
 const TIMER_COOKIE: usize = 1;
+const WM_SIGN_IN_CLOSE: u32 = WM_APP + 10;
+const ID_CRASH: i32 = 102;
+const ID_DATA: i32 = 9;
 
 struct SignIn {
     hwnd: HWND,
@@ -112,7 +116,11 @@ pub fn show() {
         form::control(h, w!("BUTTON"), w!("Sign Out"), b, 0, ID_SIGN_OUT);
         form::control(h, w!("BUTTON"), w!("Enable Two-Way Sync"), b, 0, ID_TWO_WAY);
         form::control(h, w!("BUTTON"), w!("Open Backups Folder"), b, 0, ID_BACKUPS);
+        form::control(h, w!("BUTTON"), w!("Open Data Folder"), b, 0, ID_DATA);
         form::control(h, w!("STATIC"), w!(""), 0, 0, ID_STATUS);
+        if super::crash_log_path().exists() {
+            form::control(h, w!("STATIC"), w!("A crash report was saved as crash.log in the data folder. It contains no notes, email address or token."), 0, 0, ID_CRASH);
+        }
         form::control(
             h,
             w!("STATIC"),
@@ -214,7 +222,8 @@ unsafe fn read_email(h: HWND) -> String {
 
 pub fn on_signed_in() {
     let a = app();
-    let result = a.sign_in_result.lock().unwrap().take();
+    super::stage("sign-in result received");
+    let result = a.sign_in_result.lock().ok().and_then(|mut g| g.take());
     match result {
         Some(Ok(email)) => {
             if prepare_for_account(&email) {
@@ -309,6 +318,8 @@ unsafe fn poll_cookie() -> windows::core::Result<()> {
     manager.GetCookies(&HSTRING::from("https://accounts.google.com"), &handler)
 }
 
+/// Runs inside a WebView2 callback, so it must not close WebView2 here. It starts saving
+/// the sign-in first, then asks the window to close itself once the callback has returned.
 fn finish_sign_in(cookie: String) {
     let details = SIGN_IN.with(|s| {
         let mut b = s.borrow_mut();
@@ -317,32 +328,32 @@ fn finish_sign_in(cookie: String) {
             return None;
         }
         st.done = true;
-        Some((st.hwnd, st.email.clone(), st.webview.clone()))
+        Some((st.hwnd, st.email.clone()))
     });
-    let Some((hwnd, email, view)) = details else { return };
-    unsafe {
-        let _ = KillTimer(Some(hwnd), TIMER_COOKIE);
-        if let Some(v) = view {
-            if let Ok(m) = v.cast::<ICoreWebView2_2>().and_then(|x| x.CookieManager()) {
-                let _ = m.DeleteAllCookies(); // Google's session must not outlive the sign-in.
-            }
-        }
-        let _ = DestroyWindow(hwnd);
-    }
+    let Some((hwnd, email)) = details else { return };
+    super::stage("sign-in cookie received");
     let a = app();
     let android_id = a.android_id();
     let slot = a.sign_in_result.clone();
     let main = a.main.get().0 as isize;
     std::thread::spawn(move || {
+        super::stage("token exchange started");
         let outcome = exchange_cookie(&email, &cookie, &android_id).map_err(|e| e.to_string()).and_then(|master| {
             creds::save(&email, &master).map_err(|e| format!("Windows Credential Manager refused the token: {e}"))?;
+            super::stage("token saved");
             Ok(email.clone())
         });
-        *slot.lock().unwrap() = Some(outcome);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(outcome);
+        }
         unsafe {
             let _ = PostMessageW(Some(HWND(main as *mut _)), WM_APP_SIGNED_IN, WPARAM(0), LPARAM(0));
         }
     });
+    unsafe {
+        let _ = KillTimer(Some(hwnd), TIMER_COOKIE);
+        let _ = PostMessageW(Some(hwnd), WM_SIGN_IN_CLOSE, WPARAM(0), LPARAM(0));
+    }
 }
 
 extern "system" fn sign_in_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -363,6 +374,17 @@ extern "system" fn sign_in_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 }
                 LRESULT(0)
             }
+            WM_SIGN_IN_CLOSE => {
+                super::stage("closing sign-in window");
+                let _ = ShowWindow(h, SW_HIDE);
+                let view = SIGN_IN.with(|s| s.borrow().as_ref().and_then(|st| st.webview.clone()));
+                if let Some(m) = view.and_then(|v| v.cast::<ICoreWebView2_2>().ok()).and_then(|x| x.CookieManager().ok()) {
+                    let _ = m.DeleteAllCookies(); // Google's session must not outlive the sign-in.
+                }
+                let _ = DestroyWindow(h);
+                super::stage("sign-in window closed");
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 let _ = KillTimer(Some(h), TIMER_COOKIE);
                 let state = SIGN_IN.with(|s| s.borrow_mut().take());
@@ -378,6 +400,9 @@ extern "system" fn sign_in_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 
 extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        if let Some(r) = super::theme::frame_message(h, msg, wp, lp) {
+            return r;
+        }
         if !app().account.get().is_invalid() {
             if let Some(r) = super::theme::chrome_message(h, msg, wp, lp) {
                 return r;
@@ -393,7 +418,7 @@ extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     match (wp.0 & 0xFFFF) as i32 {
                         ID_SIGN_IN => {
                             let email = read_email(h);
-                            if creds::load().is_some() {
+                            if creds::load().is_some() && !super::mock_requested() {
                                 report_error("Please sign out before signing in again.");
                             } else if !email.contains('@') {
                                 report_error("Please enter your Google account email address first.");
@@ -415,6 +440,9 @@ extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                         ID_TWO_WAY => {
                             toggle_two_way();
                             update_status();
+                        }
+                        ID_DATA => {
+                            ShellExecuteW(None, w!("open"), &HSTRING::from(data_dir().as_os_str()), None, None, SW_SHOWNORMAL);
                         }
                         ID_BACKUPS => {
                             let dir = backups_dir();

@@ -125,6 +125,9 @@ pub unsafe fn flow_buttons(parent: HWND, ids: &[i32], x0: i32, y0: i32, width: i
     let (mut x, mut y) = (x0, y0);
     for id in ids {
         let Ok(c) = GetDlgItem(Some(parent), *id) else { continue };
+        if GetWindowLongW(c, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+            continue;
+        }
         let w = button_width(parent, c).max(min_w).min(width);
         if x > x0 && x + w > x0 + width {
             x = x0;
@@ -145,7 +148,7 @@ pub unsafe fn layout_rows(h: HWND, rows: &[Row], scroll: i32) -> i32 {
     let m = scale(h, 16);
     let gap = sized(h, 10, 14);
     let width = (c.right - 2 * m).max(scale(h, 120));
-    let mut y = m - scroll;
+    let mut y = super::theme::top_inset(h) + m - scroll;
     for row in rows {
         match *row {
             Row::Title(id) | Row::Text(id) => {
@@ -207,6 +210,15 @@ pub unsafe fn relayout(h: HWND) {
             s.scroll = clamped;
             s.content = content;
         });
+        // Rows scrolled up under the macOS title strip are hidden so they never cover it.
+        let inset = super::theme::top_inset(h);
+        for child in children(h) {
+            let mut r = RECT::default();
+            let _ = GetWindowRect(child, &mut r);
+            let mut pt = POINT { x: r.left, y: r.top };
+            let _ = ScreenToClient(h, &mut pt);
+            let _ = ShowWindow(child, if pt.y < inset { SW_HIDE } else { SW_SHOWNA });
+        }
         if after.right == c.right && clamped == pos {
             break;
         }

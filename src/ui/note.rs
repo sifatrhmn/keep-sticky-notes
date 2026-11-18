@@ -41,6 +41,7 @@ const CMD_LABEL: usize = 300;
 const CMD_PIN: usize = 500;
 const CMD_ARCHIVE: usize = 501;
 const CMD_DELETE: usize = 502;
+const CMD_DRAW: usize = 503;
 const CMD_THEME: usize = 600;
 
 const FMT_COUNT: usize = 6;
@@ -181,6 +182,8 @@ pub struct NoteWin {
     pending: Cell<bool>,
     loading: Cell<bool>,
     pan_y: Cell<i32>,
+    /// The note's drawings with decoded thumbnails.
+    drawings: RefCell<Vec<(keepsticky::store::Drawing, Option<super::draw::Image>)>>,
 }
 
 fn lp_xy(lp: LPARAM) -> (i32, i32) {
@@ -199,6 +202,14 @@ fn get_text(h: HWND) -> String {
 fn set_text(h: HWND, s: &str) {
     unsafe {
         let _ = SetWindowTextW(h, &HSTRING::from(s.replace('\n', "\r\n")));
+    }
+}
+
+/// Refreshes the drawing thumbnails of an open note.
+pub fn reload_drawings(note_id: &str) {
+    let found = app().snapshot_notes().into_iter().find(|n| *n.id.borrow() == note_id);
+    if let Some(n) = found {
+        n.load_drawings();
     }
 }
 
@@ -263,7 +274,7 @@ fn heading_twips() -> i32 {
 }
 
 fn is_mac() -> bool {
-    app().theme.get() == theme::Theme::Mac
+    app().theme.get().is_mac()
 }
 
 impl NoteWin {
@@ -390,6 +401,7 @@ impl NoteWin {
                 pending: Cell::new(false),
                 loading: Cell::new(false),
                 pan_y: Cell::new(0),
+                drawings: RefCell::new(Vec::new()),
             });
             a.notes.borrow_mut().insert(hwnd.0 as isize, win.clone());
             win.apply_fonts();
@@ -621,6 +633,7 @@ impl NoteWin {
             self.restyle();
         }
         self.loading.set(false);
+        self.load_drawings();
         self.layout_rows();
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd.get()), None, false);
@@ -761,7 +774,7 @@ impl NoteWin {
             let list = self.is_list.get();
             let _ = MoveWindow(self.title.get(), m, self.title_h() + self.s(4), c.right - 2 * m, self.t(24, 32), true);
             let top = self.content_top();
-            let _ = MoveWindow(self.body.get(), m, top, c.right - 2 * m, (c.bottom - top - self.t(44, 58)).max(1), true);
+            let _ = MoveWindow(self.body.get(), m, top, c.right - 2 * m, (c.bottom - top - self.t(44, 58) - self.strip_h()).max(1), true);
             let _ = ShowWindow(self.title.get(), if rolled { SW_HIDE } else { SW_SHOW });
             let _ = ShowWindow(self.body.get(), if rolled || list { SW_HIDE } else { SW_SHOW });
         }
@@ -819,7 +832,93 @@ impl NoteWin {
         unsafe {
             let _ = GetClientRect(self.hwnd.get(), &mut c);
         }
-        (c.bottom - self.content_top()).max(0)
+        (c.bottom - self.content_top() - self.strip_h()).max(0)
+    }
+
+    /// Height of the drawing thumbnails strip (zero when the note has no drawings).
+    fn strip_h(&self) -> i32 {
+        if self.drawings.borrow().is_empty() || self.rolled.get() {
+            0
+        } else {
+            self.t(84, 104)
+        }
+    }
+
+    /// Rectangles of the drawing thumbnails, above the formatting bar.
+    fn thumb_rects(&self) -> Vec<RECT> {
+        let h = self.strip_h();
+        if h == 0 {
+            return Vec::new();
+        }
+        let mut c = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd.get(), &mut c);
+        }
+        let bottom = c.bottom - if self.is_list.get() { self.s(8) } else { self.t(44, 58) };
+        let top = bottom - h + self.s(6);
+        let th = bottom - top;
+        let tw = th * 10 / 7;
+        let gap = self.s(6);
+        (0..self.drawings.borrow().len())
+            .map(|i| {
+                let x = self.s(10) + i as i32 * (tw + gap);
+                RECT { left: x, top, right: x + tw, bottom }
+            })
+            .collect()
+    }
+
+    fn thumb_at(&self, x: i32, y: i32) -> Option<usize> {
+        self.thumb_rects().iter().position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+    }
+
+    /// Reloads the note's drawings from the store.
+    pub fn load_drawings(&self) {
+        let id = self.id.borrow().clone();
+        let list = app().store.drawings(&id).unwrap_or_default();
+        let decoded = list
+            .into_iter()
+            .map(|d| {
+                let img = super::draw::Image::from_bytes(&d.png);
+                (d, img)
+            })
+            .collect();
+        *self.drawings.borrow_mut() = decoded;
+        self.layout();
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd.get()), None, false);
+        }
+    }
+
+    unsafe fn paint_drawings(&self, dc: HDC, f: super::Fonts) {
+        let rects = self.thumb_rects();
+        if rects.is_empty() {
+            return;
+        }
+        let pal = self.pal.get();
+        let edge = CreatePen(PS_SOLID, 1, rgb(pal.muted));
+        let white = CreateSolidBrush(rgb(0xFFFFFF));
+        let rad = self.s(8);
+        for (r, (d, img)) in rects.iter().zip(self.drawings.borrow().iter()) {
+            let ob = SelectObject(dc, white.into());
+            let op = SelectObject(dc, edge.into());
+            let _ = RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            let inner = RECT { left: r.left + 2, top: r.top + 2, right: r.right - 2, bottom: r.bottom - 2 };
+            match img {
+                Some(img) => img.draw_fit(dc, inner),
+                None => {
+                    SelectObject(dc, f.ui.into());
+                    SetTextColor(dc, rgb(0x5F6368));
+                    let label = if d.from_keep() { "Drawing in Google Keep" } else { "Drawing" };
+                    let mut w: Vec<u16> = label.encode_utf16().collect();
+                    let mut t = inner;
+                    DrawTextW(dc, &mut w, &mut t, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+                }
+            }
+        }
+        let _ = DeleteObject(edge.into());
+        let _ = DeleteObject(white.into());
     }
 
     fn clamp_scroll(&self) {
@@ -1047,6 +1146,8 @@ impl NoteWin {
             let _ = AppendMenuW(menu, MF_STRING | pin_flag, CMD_PIN, w!("Pinned in Google Keep"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_ARCHIVE, w!("Archive"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE, w!("Delete (move to Bin)"));
+            let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, CMD_DRAW, w!("Add Drawing"));
+            let _ = InsertMenuW(menu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, None);
 
             let hwnd = self.hwnd.get();
             let b = self.button_rect(BTN_MENU);
@@ -1077,6 +1178,10 @@ impl NoteWin {
                 }
                 CMD_PIN => {
                     let _ = a.store.set_pinned(&id, !top.pinned);
+                }
+                CMD_DRAW => {
+                    super::draw::open(&id, None);
+                    changed = false;
                 }
                 CMD_ARCHIVE => {
                     let _ = a.store.set_archived(&id, true);
@@ -1135,7 +1240,8 @@ impl NoteWin {
         FillRect(dc, &c, self.brush.get());
         if mac {
             // A soft vertical gradient, like a macOS title bar.
-            let (top, bottom) = (theme::lighten(pal.bg, 35), pal.bar);
+            let dark = app().theme.get().is_dark();
+            let (top, bottom) = if dark { (theme::lighten(pal.bg, 12), pal.bg) } else { (theme::lighten(pal.bg, 75), theme::lighten(pal.bg, 6)) };
             let th = self.title_h().max(1);
             let mix = |a: u32, b: u32, k: i32, sh: u32| -> u32 {
                 let (x, y) = (((a >> sh) & 0xFF) as i32, ((b >> sh) & 0xFF) as i32);
@@ -1147,7 +1253,7 @@ impl NoteWin {
                 FillRect(dc, &RECT { left: 0, top: line, right: c.right, bottom: line + 1 }, br);
                 let _ = DeleteObject(br.into());
             }
-            let sep = CreateSolidBrush(rgb(theme::darken(pal.bg, 18)));
+            let sep = CreateSolidBrush(rgb(if dark { 0x000000 } else { theme::darken(pal.bg, 9) }));
             FillRect(dc, &RECT { left: 0, top: th - 1, right: c.right, bottom: th }, sep);
             let _ = DeleteObject(sep.into());
         } else {
@@ -1177,7 +1283,7 @@ impl NoteWin {
                 continue;
             }
             if self.hover.get() == i as i32 {
-                FillRect(dc, &r, hover_brush);
+                self.fill_hover(dc, r, hover_brush, mac);
             }
             SelectObject(dc, f.icon.into());
             if mac {
@@ -1199,7 +1305,7 @@ impl NoteWin {
             for i in 0..FMT_COUNT {
                 let r = self.fmt_rect(i);
                 if self.hover.get() == FMT_HOVER_BASE + i as i32 {
-                    FillRect(dc, &r, hover_brush);
+                    self.fill_hover(dc, r, hover_brush, mac);
                 }
                 SelectObject(dc, faces[i].into());
                 let mut w: Vec<u16> = labels[i].encode_utf16().collect();
@@ -1226,6 +1332,9 @@ impl NoteWin {
         } else if self.is_list.get() {
             self.paint_rows(dc, c, f);
         }
+        if !self.rolled.get() {
+            self.paint_drawings(dc, f);
+        }
 
         SelectObject(dc, old_font);
         let _ = BitBlt(target, 0, 0, c.right, c.bottom, Some(dc), 0, 0, SRCCOPY);
@@ -1234,42 +1343,44 @@ impl NoteWin {
         let _ = DeleteDC(dc);
     }
 
+    /// Hover highlight: a soft capsule in the macOS theme, a plain block otherwise.
+    unsafe fn fill_hover(&self, dc: HDC, r: RECT, brush: HBRUSH, mac: bool) {
+        if !mac {
+            FillRect(dc, &r, brush);
+            return;
+        }
+        let ob = SelectObject(dc, brush.into());
+        let op = SelectObject(dc, GetStockObject(NULL_PEN));
+        let pad = self.s(3);
+        let rad = self.s(14);
+        let _ = RoundRect(dc, r.left + pad, r.top + pad, r.right - pad + 1, r.bottom - pad + 1, rad, rad);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+    }
+
     /// One macOS-style traffic light. Green shows whether the note is kept on top.
     unsafe fn draw_light(&self, dc: HDC, i: usize, slot: RECT, hovered: bool, tiny: HFONT) {
         let colour = match i {
             BTN_CLOSE => 0xFF5F57,
             BTN_ROLL => 0xFEBC2E,
             _ if self.topmost.get() => 0x28C840,
-            _ => 0xC8C8C8,
+            _ if app().theme.get().is_dark() => 0x5A5A5E,
+            _ => 0xD0D0D5,
         };
-        let d = self.t(12, 20);
-        let cx = (slot.left + slot.right) / 2;
-        let cy = (slot.top + slot.bottom) / 2;
-        let brush = CreateSolidBrush(rgb(colour));
-        let pen = CreatePen(PS_SOLID, 1, rgb(theme::darken(colour, 18)));
-        let ob = SelectObject(dc, brush.into());
-        let op = SelectObject(dc, pen.into());
-        let _ = Ellipse(dc, cx - d / 2, cy - d / 2, cx - d / 2 + d, cy - d / 2 + d);
-        SelectObject(dc, ob);
-        SelectObject(dc, op);
-        let _ = DeleteObject(brush.into());
-        let _ = DeleteObject(pen.into());
-        if hovered {
-            let glyph = match i {
-                BTN_CLOSE => 0xE711,
-                BTN_ROLL => if self.rolled.get() { 0xE70D } else { 0xE738 },
-                _ => 0xE718,
-            };
-            SelectObject(dc, tiny.into());
-            SetTextColor(dc, rgb(0x4A1F1C));
-            self.draw_glyph(dc, glyph, RECT { left: cx - d / 2, top: cy - d / 2, right: cx - d / 2 + d, bottom: cy - d / 2 + d });
-        }
+        let glyph = match i {
+            BTN_CLOSE => 0xE711,
+            BTN_ROLL if self.rolled.get() => 0xE70D,
+            BTN_ROLL => 0xE738,
+            _ => 0xE718,
+        };
+        let (cx, cy) = ((slot.left + slot.right) / 2, (slot.top + slot.bottom) / 2);
+        theme::draw_light(dc, cx, cy, self.t(12, 20), colour, if hovered { Some(glyph) } else { None }, tiny);
     }
 
     unsafe fn paint_rows(&self, dc: HDC, c: RECT, f: super::Fonts) {
         let top = self.content_top();
         let saved = SaveDC(dc);
-        IntersectClipRect(dc, 0, top, c.right, c.bottom);
+        IntersectClipRect(dc, 0, top, c.right, c.bottom - self.strip_h());
         let scroll = self.scroll.get();
         let box_x = self.s(12);
         let box_size = self.t(16, 24);
@@ -1514,6 +1625,13 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
             }
             WM_LBUTTONDOWN => {
                 let (x, y) = lp_xy(lp);
+                if let Some(i) = win.thumb_at(x, y) {
+                    let d = win.drawings.borrow().get(i).map(|d| d.0.clone());
+                    if let Some(d) = d {
+                        super::draw::open(&win.id.borrow().clone(), Some(&d));
+                    }
+                    return LRESULT(0);
+                }
                 if win.button_at(x, y).is_none() && win.is_list.get() {
                     win.click_list(x, y);
                 }

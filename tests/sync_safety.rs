@@ -444,3 +444,79 @@ fn account_reset_clears_cursor_and_notes() {
     assert!(store.kv_get("keep_to_version").unwrap().is_none());
     assert!(store.kv_get("two_way_sync").unwrap().is_none());
 }
+
+#[test]
+fn delete_forever_reaches_server_and_leaves_bin() {
+    let (store, server) = (new_store(), MockKeep::default());
+    let id = make_synced_note(&store, &server, "Gone", "x");
+    store.trash(&id).unwrap();
+    sync(&store, &server);
+    store.delete_forever(&id).unwrap();
+    assert_eq!(store.dirty_count().unwrap(), 1);
+    assert!(store.list_top(Shelf::Trash, "").unwrap().is_empty());
+    sync(&store, &server);
+    let gone = server.node(&id).map(|n| n["timestamps"]["deleted"].as_str().unwrap_or("").starts_with("20")).unwrap_or(true);
+    assert!(gone);
+}
+
+#[test]
+fn delete_forever_of_unsynced_note_removes_it_locally() {
+    let store = new_store();
+    let id = store.create_note(TYPE_NOTE).unwrap();
+    store.trash(&id).unwrap();
+    store.delete_forever(&id).unwrap();
+    assert!(store.get(&id).unwrap().is_none());
+    assert_eq!(store.dirty_count().unwrap(), 0);
+}
+
+#[test]
+fn pin_from_manager_syncs() {
+    let (store, server) = (new_store(), MockKeep::default());
+    let id = make_synced_note(&store, &server, "Pin", "x");
+    store.set_pinned(&id, true).unwrap();
+    sync(&store, &server);
+    assert_eq!(server.node(&id).unwrap()["isPinned"], true);
+}
+
+#[test]
+fn local_drawings_are_saved_and_never_sent() {
+    let (store, server) = (new_store(), MockKeep::default());
+    let id = make_synced_note(&store, &server, "Sketch", "x");
+    let d = store.add_drawing(&id, "[]", b"png1", b"").unwrap();
+    store.save_drawing(d, "[{\"t\":0}]", b"png2").unwrap();
+    let all = store.drawings(&id).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].png, b"png2");
+    assert!(!all[0].from_keep());
+    assert_eq!(store.dirty_count().unwrap(), 0);
+    let before = server.requests.lock().unwrap().len();
+    sync(&store, &server);
+    let sent: usize = server.requests.lock().unwrap()[before..].iter().map(|r| r["nodes"].as_array().map_or(0, |n| n.len())).sum();
+    assert_eq!(sent, 0);
+    store.delete_drawing(d).unwrap();
+    assert!(store.drawings(&id).unwrap().is_empty());
+}
+
+#[test]
+fn keep_drawing_is_downloaded_and_left_untouched() {
+    let (store, server) = (new_store(), MockKeep::default());
+    let id = make_synced_note(&store, &server, "Has drawing", "x");
+    let note_sid = server.node(&id).unwrap()["serverId"].as_str().unwrap_or(&id).to_string();
+    let blob = json!({
+        "kind": "notes#node", "id": "blob1", "serverId": "blobsid1", "parentId": id, "parentServerId": note_sid,
+        "type": "BLOB", "timestamps": {"created": "2026-01-01T00:00:00.000000Z", "updated": "2026-01-01T00:00:00.000000Z"},
+        "blob": {"kind": "notes#blob", "type": "DRAWING", "mimetype": "image/png", "drawingInfo": {"drawingId": "d1"}}
+    });
+    server.remote_insert(blob.clone());
+    sync(&store, &server);
+    let all = store.drawings(&id).unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(all[0].from_keep());
+    assert_eq!(all[0].png, keepsticky::keep::TEST_PNG);
+    // A Keep drawing can neither be changed nor deleted locally, and is never pushed.
+    store.save_drawing(all[0].id, "[]", b"x").unwrap();
+    store.delete_drawing(all[0].id).unwrap();
+    assert_eq!(store.drawings(&id).unwrap()[0].png, keepsticky::keep::TEST_PNG);
+    assert_eq!(store.dirty_count().unwrap(), 0);
+    assert_eq!(server.node("blob1").unwrap()["blob"], blob["blob"]);
+}

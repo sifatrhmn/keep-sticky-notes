@@ -1,6 +1,7 @@
 //! Application shell: single instance, tray icon, global hotkey, background synchronisation.
 
 mod about;
+mod draw;
 mod account;
 mod form;
 mod hub;
@@ -19,12 +20,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -148,7 +152,7 @@ impl App {
         };
         let f = Fonts {
             ui: make(15, 400, 0, 0, 0, w!("Segoe UI")),
-            bold: make(15, 600, 0, 0, 0, w!("Segoe UI")),
+            bold: make(15, 700, 0, 0, 0, w!("Segoe UI")),
             italic: make(15, 400, 1, 0, 0, w!("Segoe UI")),
             underline: make(15, 400, 0, 1, 0, w!("Segoe UI")),
             strike: make(15, 400, 0, 0, 1, w!("Segoe UI")),
@@ -242,26 +246,18 @@ impl App {
             theme::apply_chrome(self.hub.get());
             theme::apply_chrome(self.account.get());
             theme::apply_chrome(about::handle());
+            hub::apply_touch();
+            form::relayout(self.account.get());
+            form::relayout(about::handle());
         }
         for n in self.snapshot_notes() {
             n.apply_theme();
         }
     }
 
-    /// Switches between the last light theme and the last dark theme used.
+    /// Light/Dark Mode: OLED Black and Light swap, and so do the two macOS styles.
     pub fn toggle_light(&self) {
-        let current = self.theme.get();
-        if current.is_dark() {
-            let _ = self.store.kv_set("last_dark_theme", current.key());
-            let last = self.store.kv_get("last_light_theme").ok().flatten();
-            let light = Theme::from_key(last.as_deref());
-            self.set_theme(if light.is_dark() { Theme::Classic } else { light });
-        } else {
-            let _ = self.store.kv_set("last_light_theme", current.key());
-            let last = self.store.kv_get("last_dark_theme").ok().flatten();
-            let dark = Theme::from_key(last.as_deref());
-            self.set_theme(if dark.is_dark() { dark } else { Theme::Black });
-        }
+        self.set_theme(self.theme.get().counterpart());
     }
 
     pub fn toggle_label(&self) -> PCWSTR {
@@ -283,6 +279,68 @@ impl App {
         let id = new_android_id();
         let _ = self.store.kv_set("android_id", &id);
         id
+    }
+}
+
+static STAGE: Mutex<&'static str> = Mutex::new("starting");
+static CRASHES: AtomicU32 = AtomicU32::new(0);
+
+/// Records the last milestone reached, so a crash report can say where the app was.
+pub fn stage(name: &'static str) {
+    if let Ok(mut g) = STAGE.try_lock() {
+        *g = name;
+    }
+}
+
+pub fn crash_log_path() -> PathBuf {
+    data_dir().join("crash.log")
+}
+
+/// Appends one line to crash.log. Never includes note text, email addresses or tokens.
+fn write_crash(kind: &str, detail: &str) {
+    if CRASHES.fetch_add(1, Ordering::SeqCst) >= 3 {
+        return;
+    }
+    use std::io::Write;
+    let stage = STAGE.try_lock().map(|g| *g).unwrap_or("unknown");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crash_log_path()) {
+        let _ = writeln!(
+            f,
+            "{} | version {} | {} | {kind} | {detail} | last stage: {stage}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::ARCH
+        );
+    }
+}
+
+unsafe extern "system" fn on_exception(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if !info.is_null() && !(*info).ExceptionRecord.is_null() {
+        let rec = &*(*info).ExceptionRecord;
+        let code = rec.ExceptionCode.0 as u32;
+        // Only fatal faults: access violation, illegal instruction, stack overrun, heap corruption and similar.
+        if matches!(code, 0xC0000005 | 0xC000001D | 0xC0000409 | 0xC00000FD | 0xC0000094 | 0xC000041D | 0xC0000374) {
+            let addr = rec.ExceptionAddress as usize;
+            let mut module = HMODULE::default();
+            let (mut name, mut offset) = (String::from("unknown module"), addr);
+            let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+            if GetModuleHandleExW(flags, PCWSTR(addr as *const u16), &mut module).is_ok() {
+                let mut buf = [0u16; 260];
+                let n = GetModuleFileNameW(Some(module), &mut buf) as usize;
+                let full = String::from_utf16_lossy(&buf[..n]);
+                name = full.rsplit('\\').next().unwrap_or("").to_string();
+                offset = addr.wrapping_sub(module.0 as usize);
+            }
+            write_crash("exception", &format!("code {code:#010x} in {name}+{offset:#x}"));
+        }
+    }
+    0 // Continue the normal search, so Windows still handles the fault as usual.
+}
+
+fn install_crash_log() {
+    std::panic::set_hook(Box::new(|info| write_crash("panic", &info.to_string())));
+    unsafe {
+        AddVectoredExceptionHandler(1, Some(on_exception));
     }
 }
 
@@ -404,9 +462,11 @@ fn sync_thread(db: PathBuf, rx: std::sync::mpsc::Receiver<SyncCmd>, hwnd: isize,
         let allow_push = store.kv_get(KEY_TWO_WAY).ok().flatten().as_deref() == Some("1");
         *status.lock().unwrap() = "Synchronising...".into();
         notify(false);
+        stage("sync started");
         let result = SyncEngine { store: &store, backend: backend.as_ref().unwrap(), allow_push }.sync_once();
         match result {
             Ok(report) => {
+                stage("sync finished");
                 delay = POLL;
                 let clock = chrono::Local::now().format("%H:%M");
                 let mut text = format!("Last synchronised at {clock}.");
@@ -564,6 +624,7 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                         n.reload_if_idle();
                     }
                     hub::refresh();
+                    stage("notes reloaded");
                 }
                 hub::update_status();
                 account::update_status();
@@ -625,6 +686,10 @@ pub fn run() {
             return;
         }
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        install_crash_log();
+        if cfg!(debug_assertions) && std::env::var_os("KEEP_STICKY_TEST_CRASH").is_some() {
+            panic!("test crash requested");
+        }
 
         let db_path = data_dir().join("notes.db");
         let store = match Store::open(&db_path) {
@@ -642,6 +707,8 @@ pub fn run() {
             ..Default::default()
         };
         RegisterClassW(&wc);
+        draw::startup();
+        draw::register();
         note::register();
         hub::register();
         account::register();
