@@ -41,6 +41,8 @@ const LBS_HASSTRINGS_STYLE: u32 = 0x40;
 thread_local! {
     static IDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static PINNED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    /// The rows last shown, so an unchanged list is not rebuilt.
+    static ROWS: RefCell<Vec<(String, usize, String, bool)>> = const { RefCell::new(Vec::new()) };
     static LAYING_OUT: Cell<bool> = const { Cell::new(false) };
     /// macOS theme: rounded panels drawn behind the search box and the list.
     static PANELS: Cell<(RECT, RECT)> = const { Cell::new((RECT { left: 0, top: 0, right: 0, bottom: 0 }, RECT { left: 0, top: 0, right: 0, bottom: 0 })) };
@@ -85,6 +87,7 @@ pub fn show() {
             return;
         };
         a.hub.set(h);
+        ROWS.with(|r| r.borrow_mut().clear());
         let tab = WS_TABSTOP.0;
         let b = tab | 0xB;
         let search = form::control(h, w!("EDIT"), PCWSTR::null(), tab | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE.0, ID_SEARCH);
@@ -228,43 +231,46 @@ pub fn refresh() {
         let query = String::from_utf16_lossy(&buf[..n]);
         let docs = a.store.list_top(shelf, &query).unwrap_or_default();
         let list = item(h, ID_LIST);
-        let selected = selected_ids(h);
-        SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None);
-        SendMessageW(list, LB_RESETCONTENT, None, None);
-        let mut ids = Vec::with_capacity(docs.len() + 2);
-        let mut pinned = Vec::with_capacity(docs.len() + 2);
-        // Keep shows pinned notes under "Pinned" and the rest under "Others", but only when something is pinned.
+        // Build the rows first: (text, item data, note id, pinned). Headings have an empty id.
         let sections = shelf == Shelf::Notes && docs.iter().any(|d| d.top.pinned);
-        let header = |label: &str, ids: &mut Vec<String>, pinned: &mut Vec<bool>| {
-            let text = HSTRING::from(label);
-            let pos = SendMessageW(list, LB_ADDSTRING, None, Some(LPARAM(text.as_ptr() as isize))).0;
-            SendMessageW(list, LB_SETITEMDATA, Some(WPARAM(pos as usize)), Some(LPARAM(super::theme::SECTION_HEADER as isize)));
-            ids.push(String::new());
-            pinned.push(false);
-        };
+        let mut rows: Vec<(String, usize, String, bool)> = Vec::with_capacity(docs.len() + 2);
+        let heading = |label: &str| (label.to_string(), super::theme::SECTION_HEADER, String::new(), false);
         if sections {
-            header("PINNED", &mut ids, &mut pinned);
+            rows.push(heading("PINNED"));
         }
         let mut others_shown = false;
         for d in &docs {
             if sections && !d.top.pinned && !others_shown {
-                header("OTHERS", &mut ids, &mut pinned);
+                rows.push(heading("OTHERS"));
                 others_shown = true;
             }
-            let text = HSTRING::from(summary(d));
-            let pos = SendMessageW(list, LB_ADDSTRING, None, Some(LPARAM(text.as_ptr() as isize))).0;
             let tint = super::theme::colour_index(&d.top.colour) + 1;
-            SendMessageW(list, LB_SETITEMDATA, Some(WPARAM(pos as usize)), Some(LPARAM(tint as isize)));
-            if selected.contains(&d.top.id) {
-                SendMessageW(list, LB_SETSEL, Some(WPARAM(1)), Some(LPARAM(pos)));
-            }
-            ids.push(d.top.id.clone());
-            pinned.push(d.top.pinned);
+            rows.push((summary(d), tint, d.top.id.clone(), d.top.pinned));
         }
-        SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None);
-        let _ = InvalidateRect(Some(list), None, true);
-        IDS.with(|i| *i.borrow_mut() = ids);
-        PINNED.with(|p| *p.borrow_mut() = pinned);
+        // Rebuilding the list resets its scroll position, so only do it when something changed,
+        // and then keep the scroll position and selection.
+        if ROWS.with(|r| *r.borrow() != rows) {
+            let selected = selected_ids(h);
+            let top = SendMessageW(list, LB_GETTOPINDEX, None, None).0.max(0);
+            SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None);
+            SendMessageW(list, LB_RESETCONTENT, None, None);
+            for (text, data, id, _) in &rows {
+                let text = HSTRING::from(text.as_str());
+                let pos = SendMessageW(list, LB_ADDSTRING, None, Some(LPARAM(text.as_ptr() as isize))).0;
+                SendMessageW(list, LB_SETITEMDATA, Some(WPARAM(pos as usize)), Some(LPARAM(*data as isize)));
+                if !id.is_empty() && selected.contains(id) {
+                    SendMessageW(list, LB_SETSEL, Some(WPARAM(1)), Some(LPARAM(pos)));
+                }
+            }
+            SendMessageW(list, LB_SETTOPINDEX, Some(WPARAM(top as usize)), None);
+            SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None);
+            let _ = InvalidateRect(Some(list), None, true);
+            IDS.with(|i| *i.borrow_mut() = rows.iter().map(|r| r.2.clone()).collect());
+            PINNED.with(|p| *p.borrow_mut() = rows.iter().map(|r| r.3).collect());
+            ROWS.with(|r| *r.borrow_mut() = rows);
+        } else {
+            let _ = InvalidateRect(Some(list), None, false); // repaint for a theme change, without moving
+        }
         let _ = SetWindowTextW(item(h, ID_THEME), a.toggle_label());
         let in_bin = shelf == Shelf::Trash;
         let archive_label = if shelf == Shelf::Archive { w!("Unarchive") } else { w!("Archive") };
