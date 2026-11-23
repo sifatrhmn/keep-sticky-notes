@@ -13,7 +13,7 @@ pub const MARKER: u8 = 32;
 pub const BULLET_PREFIX: &str = "\u{2022} ";
 pub const HEADING_PREFIX: &str = "# ";
 
-const NL: u16 = b'\n' as u16;
+pub const NL: u16 = b'\n' as u16;
 const SPACE: u16 = b' ' as u16;
 const TAB: u16 = b'\t' as u16;
 

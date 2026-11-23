@@ -23,6 +23,14 @@ const ID_TITLE: isize = 10;
 const ID_BODY: isize = 11;
 const ID_ITEM: isize = 12;
 const TIMER_SAVE: usize = 1;
+/// Reformatting waits for a short pause in typing, so each key press stays fast.
+const TIMER_STYLE: usize = 2;
+const STYLE_DELAY: u32 = 120;
+/// Smooth-scrolling animation frame.
+const TIMER_SCROLL: usize = 3;
+const EM_GETSCROLLPOS: u32 = 0x4DD;
+const EM_SETSCROLLPOS: u32 = 0x4DE;
+const SCROLL_FRAME: u32 = 15;
 const SAVE_DELAY: u32 = 500;
 const BASE_W: i32 = 300;
 const BASE_H: i32 = 300;
@@ -182,6 +190,12 @@ pub struct NoteWin {
     pending: Cell<bool>,
     loading: Cell<bool>,
     pan_y: Cell<i32>,
+    /// A formatting marker was just typed, so restyle at once instead of after the pause.
+    marker_typed: Cell<bool>,
+    /// Text length at the last restyle, to spot pastes and other large edits.
+    styled_len: Cell<usize>,
+    /// Smooth scrolling: where the view is heading, in pixels.
+    scroll_target: Cell<Option<i32>>,
     /// The note's drawings with decoded thumbnails.
     drawings: RefCell<Vec<(keepsticky::store::Drawing, Option<super::draw::Image>)>>,
 }
@@ -370,6 +384,8 @@ impl NoteWin {
             SendMessageW(body, EM_GETOLEINTERFACE, None, Some(LPARAM(&mut ole as *mut _ as isize)));
             let text_doc = if ole.is_null() { None } else { IUnknown::from_raw(ole).cast::<ITextDocument>().ok() };
             let _ = SetWindowSubclass(body, Some(body_subclass), 2, hwnd.0 as usize);
+            super::form::enable_pan(body);
+            super::form::enable_pan(hwnd);
             let _ = SetWindowSubclass(item_edit, Some(item_subclass), 1, hwnd.0 as usize);
 
             let win = Rc::new(NoteWin {
@@ -401,6 +417,9 @@ impl NoteWin {
                 pending: Cell::new(false),
                 loading: Cell::new(false),
                 pan_y: Cell::new(0),
+                marker_typed: Cell::new(false),
+                styled_len: Cell::new(0),
+                scroll_target: Cell::new(None),
                 drawings: RefCell::new(Vec::new()),
             });
             a.notes.borrow_mut().insert(hwnd.0 as isize, win.clone());
@@ -483,8 +502,19 @@ impl NoteWin {
         self.refresh_palette();
     }
 
-    /// Re-applies formatting from the markers. Excluded from undo so Ctrl+Z only undoes typing.
+    /// Re-applies formatting to the whole note (loading, theme changes, pastes).
     fn restyle(&self) {
+        self.restyle_span(false);
+    }
+
+    /// After typing: re-applies formatting to the caret's line and the one before it only.
+    /// Formatting is line-based, so nothing else can have changed. Large edits restyle everything.
+    fn restyle_local(&self) {
+        self.restyle_span(true);
+    }
+
+    /// Re-applies formatting from the markers. Excluded from undo so Ctrl+Z only undoes typing.
+    fn restyle_span(&self, local: bool) {
         if self.is_list.get() {
             return;
         }
@@ -501,10 +531,30 @@ impl NoteWin {
             SendMessageW(body, WM_SETREDRAW, Some(WPARAM(0)), None);
             SendMessageW(body, EM_SETEVENTMASK, None, Some(LPARAM(0)));
             let sel = get_range(body);
-            let first = SendMessageW(body, EM_GETFIRSTVISIBLELINE, None, None).0;
-            set_char_format(body, SCF_ALL, &char_format(0, body_twips(), normal));
+            let mut view = POINT::default();
+            SendMessageW(body, EM_GETSCROLLPOS, None, Some(LPARAM(&mut view as *mut _ as isize)));
+            let big_change = text.len().abs_diff(self.styled_len.replace(text.len())) > 2;
+            let (lo, hi) = if local && !big_change {
+                let caret = (sel.min.max(0) as usize).min(text.len());
+                let nl = format::NL;
+                let line_start = |i: usize| text[..i].iter().rposition(|c| *c == nl).map_or(0, |p| p + 1);
+                let this = line_start(caret);
+                let lo = if this > 0 { line_start(this - 1) } else { 0 };
+                let hi = text[caret..].iter().position(|c| *c == nl).map_or(text.len(), |p| caret + p);
+                (lo, hi)
+            } else {
+                (0, text.len())
+            };
+            if lo == 0 && hi == text.len() {
+                set_char_format(body, SCF_ALL, &char_format(0, body_twips(), normal));
+            } else {
+                set_range(body, lo as i32, hi as i32);
+                set_char_format(body, SCF_SELECTION, &char_format(0, body_twips(), normal));
+            }
             if text.len() <= MAX_STYLED_UNITS {
-                for run in format::style_runs(&text) {
+                for mut run in format::style_runs(&text[lo..hi]) {
+                    run.start += lo;
+                    run.end += lo;
                     let mut fx = 0;
                     if run.flags & (format::BOLD | format::HEADING) != 0 {
                         fx |= CFE_BOLD;
@@ -525,13 +575,11 @@ impl NoteWin {
                 }
             }
             set_range(body, sel.min, sel.max);
-            let now = SendMessageW(body, EM_GETFIRSTVISIBLELINE, None, None).0;
-            if now != first {
-                SendMessageW(body, EM_LINESCROLL, None, Some(LPARAM(first - now)));
-            }
+            // Restore the exact pixel position, so reformatting never moves the view.
+            SendMessageW(body, EM_SETSCROLLPOS, None, Some(LPARAM(&mut view as *mut _ as isize)));
             SendMessageW(body, EM_SETEVENTMASK, None, Some(LPARAM(ENM_CHANGE)));
             SendMessageW(body, WM_SETREDRAW, Some(WPARAM(1)), None);
-            let _ = InvalidateRect(Some(body), None, true);
+            let _ = InvalidateRect(Some(body), None, false);
             if let Some(d) = &doc {
                 let _ = d.Undo(tomResume.0);
             }
@@ -628,9 +676,10 @@ impl NoteWin {
                 unsafe {
                     SendMessageW(self.body.get(), EM_SETSEL, Some(WPARAM(start as usize)), Some(LPARAM(end as isize)));
                 }
+                // Only new text needs formatting; an unchanged note is left alone after a sync.
+                self.restyle();
             }
             *self.last_body.borrow_mut() = body;
-            self.restyle();
         }
         self.loading.set(false);
         self.load_drawings();
@@ -919,6 +968,80 @@ impl NoteWin {
         }
         let _ = DeleteObject(edge.into());
         let _ = DeleteObject(white.into());
+    }
+
+    /// Current scroll position in pixels: the checklist offset, or the text body's.
+    fn scroll_pos(&self) -> i32 {
+        if self.is_list.get() {
+            return self.scroll.get();
+        }
+        let mut pt = POINT::default();
+        unsafe {
+            SendMessageW(self.body.get(), EM_GETSCROLLPOS, None, Some(LPARAM(&mut pt as *mut _ as isize)));
+        }
+        pt.y
+    }
+
+    /// Moves straight to a scroll position (used by touch, which follows the finger).
+    /// Returns the position actually reached.
+    fn set_scroll_pos(&self, y: i32) -> i32 {
+        if self.is_list.get() {
+            self.scroll.set(y);
+            self.clamp_scroll();
+            self.position_item_edit();
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd.get()), None, false);
+            }
+            return self.scroll.get();
+        }
+        let mut pt = POINT { x: 0, y: y.max(0) };
+        unsafe {
+            let mut cur = POINT::default();
+            SendMessageW(self.body.get(), EM_GETSCROLLPOS, None, Some(LPARAM(&mut cur as *mut _ as isize)));
+            pt.x = cur.x;
+            SendMessageW(self.body.get(), EM_SETSCROLLPOS, None, Some(LPARAM(&mut pt as *mut _ as isize)));
+        }
+        self.scroll_pos()
+    }
+
+    /// Touch: scroll by the finger's movement, cancelling any wheel animation.
+    fn scroll_body_by(&self, d: i32) {
+        self.scroll_target.set(None);
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd.get()), TIMER_SCROLL);
+        }
+        self.set_scroll_pos(self.scroll_pos() + d);
+    }
+
+    /// Mouse wheel and touchpad: glide towards the new position over a few frames.
+    fn smooth_scroll(&self, delta: i32) {
+        let from = self.scroll_target.get().unwrap_or_else(|| self.scroll_pos());
+        self.scroll_target.set(Some((from + delta).max(0)));
+        unsafe {
+            SetTimer(Some(self.hwnd.get()), TIMER_SCROLL, SCROLL_FRAME, None);
+        }
+        self.scroll_frame();
+    }
+
+    fn scroll_frame(&self) {
+        let Some(target) = self.scroll_target.get() else {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd.get()), TIMER_SCROLL);
+            }
+            return;
+        };
+        let cur = self.scroll_pos();
+        let gap = target - cur;
+        // Ease out: cover about a third of the remaining distance each frame.
+        let step = if gap.abs() <= 2 { gap } else { gap / 3 + gap.signum() };
+        let reached = self.set_scroll_pos(cur + step);
+        if reached == target || reached == cur {
+            // Arrived, or stopped at the top or bottom.
+            self.scroll_target.set(None);
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd.get()), TIMER_SCROLL);
+            }
+        }
     }
 
     fn clamp_scroll(&self) {
@@ -1511,7 +1634,27 @@ extern "system" fn body_subclass(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _
                     }
                 }
             }
+            if msg == WM_MOUSEWHEEL && !ctrl {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
+                w.smooth_scroll(-delta * w.s(60) / 120);
+                return LRESULT(0);
+            }
+            if msg == WM_GESTURENOTIFY {
+                super::form::enable_pan(hwnd);
+            }
+            if msg == WM_GESTURE {
+                let mut last = w.pan_y.get();
+                if let Some(d) = super::form::pan_delta(lp, &mut last) {
+                    w.pan_y.set(last);
+                    w.scroll_body_by(d);
+                    return LRESULT(0);
+                }
+            }
             if msg == WM_CHAR {
+                // Characters that start or end formatting are styled at once; others after a pause.
+                if matches!(wp.0, 0x2A | 0x5F | 0x7E | 0x23 | 13) {
+                    w.marker_typed.set(true);
+                }
                 if wp.0 == 13 && w.swallow_return.replace(false) {
                     return LRESULT(0);
                 }
@@ -1584,7 +1727,12 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                         }
                         ID_BODY => {
                             if !win.restyling.get() && !win.loading.get() {
-                                win.restyle();
+                                if win.marker_typed.replace(false) {
+                                    let _ = KillTimer(Some(hwnd), TIMER_STYLE);
+                                    win.restyle_local();
+                                } else {
+                                    SetTimer(Some(hwnd), TIMER_STYLE, STYLE_DELAY, None);
+                                }
                                 win.schedule_save();
                             }
                         }
@@ -1594,7 +1742,12 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 LRESULT(0)
             }
             WM_TIMER => {
-                if wp.0 == TIMER_SAVE {
+                if wp.0 == TIMER_STYLE {
+                    let _ = KillTimer(Some(hwnd), TIMER_STYLE);
+                    win.restyle_local();
+                } else if wp.0 == TIMER_SCROLL {
+                    win.scroll_frame();
+                } else if wp.0 == TIMER_SAVE {
                     win.flush();
                 }
                 LRESULT(0)
@@ -1657,8 +1810,9 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         LRESULT(0)
                     }
-                    Some(_) => {
+                    Some(d) => {
                         win.pan_y.set(last);
+                        win.scroll_body_by(d);
                         LRESULT(0)
                     }
                     None => DefWindowProcW(hwnd, msg, wp, lp),
@@ -1668,16 +1822,15 @@ extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESUL
                 let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
                 if wp.0 & 0x0008 != 0 /* MK_CONTROL */ {
                     win.set_opacity(win.opacity.get() + delta.signum() * 5);
-                } else if win.is_list.get() {
-                    win.scroll.set(win.scroll.get() - delta * win.s(40) / 120);
-                    win.clamp_scroll();
-                    win.position_item_edit();
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                } else {
+                    win.smooth_scroll(-delta * win.s(60) / 120);
                 }
                 LRESULT(0)
             }
             WM_DESTROY => {
                 let _ = KillTimer(Some(hwnd), TIMER_SAVE);
+                let _ = KillTimer(Some(hwnd), TIMER_STYLE);
+                let _ = KillTimer(Some(hwnd), TIMER_SCROLL);
                 let brush = win.brush.get();
                 if !brush.is_invalid() {
                     let _ = DeleteObject(brush.into());

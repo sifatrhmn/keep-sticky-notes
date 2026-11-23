@@ -55,7 +55,13 @@ foreach ($t in $targets) {
 
     $dist = "$root\$($t.Dist)"
     New-Item -ItemType Directory -Force $dist | Out-Null
-    Get-ChildItem $dist -File | Remove-Item -Force
+    # A portable app that is still running cannot be deleted, but it can be renamed; it keeps
+    # running as *.old and the new build takes its place.
+    foreach ($f in Get-ChildItem $dist -File | Where-Object { $_.Extension -ne '.old' }) {
+        try { Remove-Item $f.FullName -Force -ErrorAction Stop }
+        catch { Move-Item $f.FullName "$($f.FullName).old" -Force }
+    }
+    Get-ChildItem $dist -Filter *.old -File | ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {} }
     Copy-Item $exe "$dist\KeepStickyNotes-$($t.Arch)-portable.exe"
     Copy-Item "$root\LICENSE" "$dist\LICENSE.txt"
 

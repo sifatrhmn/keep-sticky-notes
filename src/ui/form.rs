@@ -10,7 +10,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
-use windows::Win32::UI::Input::Touch::{CloseGestureInfoHandle, GetGestureInfo, GESTUREINFO, HGESTUREINFO};
+use windows::Win32::UI::Input::Touch::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const GID_PAN: u32 = 4;
@@ -230,6 +230,18 @@ pub unsafe fn relayout(h: HWND) {
 unsafe fn scroll_to(h: HWND, pos: i32) {
     with_state(h, |s| s.scroll = pos);
     relayout(h);
+}
+
+/// Asks Windows for vertical one-finger panning with inertia (flick) on `h`, so a finger
+/// drag scrolls instead of selecting text.
+pub unsafe fn enable_pan(h: HWND) {
+    // GC_PAN_WITH_SINGLE_FINGER_VERTICALLY, _HORIZONTALLY, GC_PAN_WITH_GUTTER, GC_PAN_WITH_INERTIA.
+    const VERTICAL: u32 = 0x2;
+    const HORIZONTAL: u32 = 0x4;
+    const GUTTER: u32 = 0x8;
+    const INERTIA: u32 = 0x10;
+    let cfg = [GESTURECONFIG { dwID: GESTURECONFIG_ID(GID_PAN), dwWant: VERTICAL | GUTTER | INERTIA, dwBlock: HORIZONTAL }];
+    let _ = SetGestureConfig(h, 0, &cfg, std::mem::size_of::<GESTURECONFIG>() as u32);
 }
 
 /// Reads a one-finger pan. Returns the vertical movement since the previous event.

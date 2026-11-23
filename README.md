@@ -3,7 +3,7 @@
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
 ![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)
 ![Architecture: x64 | ARM64](https://img.shields.io/badge/architecture-x64%20%7C%20ARM64-orange.svg)
-![Release: v1.3.1](https://img.shields.io/badge/release-v1.3.1-informational.svg)
+![Release: v1.3.2](https://img.shields.io/badge/release-v1.3.2-informational.svg)
 
 Native Windows sticky notes that synchronise with Google Keep. This is an independent
 project and is not made or endorsed by Google.

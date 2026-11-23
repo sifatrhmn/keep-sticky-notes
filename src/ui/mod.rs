@@ -678,7 +678,19 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 
 pub fn run() {
     unsafe {
-        let _instance = CreateMutexW(None, true, w!("Local\\KeepStickyNotes_SingleInstance"));
+        // Debug test runs with their own data folder get their own lock, so they can run beside
+        // the owner's copy without touching it.
+        let lock = match std::env::var("KEEP_STICKY_DATA") {
+            Ok(d) if cfg!(debug_assertions) => {
+                let mut hash: u64 = 1469598103934665603;
+                for b in d.to_lowercase().bytes() {
+                    hash = (hash ^ b as u64).wrapping_mul(1099511628211);
+                }
+                HSTRING::from(format!("Local\\KeepStickyNotes_Test_{hash:016x}"))
+            }
+            _ => HSTRING::from("Local\\KeepStickyNotes_SingleInstance"),
+        };
+        let _instance = CreateMutexW(None, true, &lock);
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(existing) = FindWindowW(MAIN_CLASS, None) {
                 let _ = PostMessageW(Some(existing), WM_APP_SHOW_HUB, WPARAM(0), LPARAM(0));
